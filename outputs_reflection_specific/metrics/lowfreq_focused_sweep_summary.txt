@@ -1,0 +1,20 @@
+Focused reflection_lowfreq_blobify sweep
+Mask mode: specular_edge (fixed)
+Reference methods: original, ellipse_subtle_blur_1.4_0.60
+
+Recommended visual setting:
+- kernel=51, lowfreq-alpha=0.85, highlight-alpha=0.15
+- Naturalness: keeps a soft corneal highlight without the large opaque white patches seen in more aggressive blobify attempts.
+- Reflection suppression: stronger than the 0.75 alpha variants while keeping the reflected building/window structure less legible.
+- Artifact risk: highlight-alpha=0.15 is less shiny than 0.25; kernel=51 avoids a slightly broader smoothed look from kernel=61.
+
+Best proxy setting:
+- reflection_lowfreq_blobify__kernel_51__alpha_0p85__highlight_0p15
+- Laplacian ratio after/before: 0.211
+- Edge ratio after/before: 0.513
+- Rationale: lowest combined proxy score balancing reflection-detail reduction against change outside the reflection mask. In this run it matches the visual recommendation above.
+
+Files to inspect:
+- outputs_reflection_specific/grids/lowfreq_focused_sweep_eyezoom_grid.png
+- outputs_reflection_specific/grids/lowfreq_focused_comparison_grid_full_and_eyezoom.png
+- outputs_reflection_specific/baselines/lowfreq_sweep

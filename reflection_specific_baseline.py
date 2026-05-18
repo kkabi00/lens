@@ -51,6 +51,9 @@ MASK_SWEEP_THRESHOLDS = (170, 180, 190, 200, 210)
 QUICK_SWEEP_MASK_MODES = ("specular_edge", "specular_edge_soft")
 QUICK_SWEEP_BLOB_ALPHAS = (0.25, 0.40, 0.55)
 QUICK_SWEEP_BLOB_BRIGHTNESSES = (0.60, 0.80, 1.00)
+LOWFREQ_SWEEP_KERNELS = (51, 61)
+LOWFREQ_SWEEP_ALPHAS = (0.75, 0.85)
+LOWFREQ_SWEEP_HIGHLIGHT_ALPHAS = (0.15, 0.25)
 
 
 def make_dirs(out_dir: Path) -> Dict[str, Path]:
@@ -74,6 +77,21 @@ def get_method_order(include_ns: bool = False) -> List[str]:
 
 def param_token(value: float) -> str:
     return f"{value:.2f}".replace(".", "p")
+
+
+def lowfreq_setting_name(kernel: int, lowfreq_alpha: float, highlight_alpha: float) -> str:
+    return (
+        f"reflection_lowfreq_blobify__kernel_{kernel}"
+        f"__alpha_{param_token(lowfreq_alpha)}"
+        f"__highlight_{param_token(highlight_alpha)}"
+    )
+
+
+def lowfreq_setting_label(kernel: int, lowfreq_alpha: float, highlight_alpha: float) -> str:
+    return (
+        f"kernel={kernel}, lowfreq-alpha={lowfreq_alpha:.2f}, "
+        f"highlight-alpha={highlight_alpha:.2f}"
+    )
 
 
 def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
@@ -398,6 +416,73 @@ def reflection_blobify(
     return alpha_composite_with_alpha(image_bgr, target.astype(np.uint8), composite_alpha)
 
 
+def create_lowfreq_base(
+    image_bgr: np.ndarray,
+    lowfreq_kernel: int,
+    bilateral_low: np.ndarray | None = None,
+) -> np.ndarray:
+    lowfreq_kernel = ensure_odd(max(3, lowfreq_kernel))
+    gaussian_low = cv2.GaussianBlur(image_bgr, (lowfreq_kernel, lowfreq_kernel), 0).astype(np.float32)
+    median_kernel = ensure_odd(min(31, max(3, lowfreq_kernel // 3)))
+    median_low = cv2.medianBlur(image_bgr, median_kernel).astype(np.float32)
+    if bilateral_low is None:
+        bilateral_low = cv2.bilateralFilter(image_bgr, d=9, sigmaColor=55, sigmaSpace=25).astype(np.float32)
+    return gaussian_low * 0.62 + median_low * 0.23 + bilateral_low * 0.15
+
+
+def create_lowfreq_highlight_components(
+    image_bgr: np.ndarray,
+    reflection_mask: np.ndarray,
+    iris_mask: np.ndarray,
+    blob_blur: int,
+    blob_brightness: float,
+    blob_sigma_scale: float,
+) -> Tuple[np.ndarray, np.ndarray] | None:
+    mask_bool = reflection_mask > 0
+    highlight_pixels = image_bgr[mask_bool]
+    if len(highlight_pixels) == 0:
+        return None
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    highlight_gray = gray[mask_bool]
+    top_cut = np.percentile(highlight_gray, 80)
+    top_pixels = highlight_pixels[highlight_gray >= top_cut]
+    if len(top_pixels) == 0:
+        top_pixels = highlight_pixels
+
+    base_color = np.percentile(highlight_pixels.astype(np.float32), 60, axis=0)
+    top_color = top_pixels.astype(np.float32).mean(axis=0)
+    highlight_color = base_color * 0.55 + top_color * 0.45
+    highlight_color = np.clip(highlight_color * blob_brightness, 0, 225)
+    blob_alpha_map = component_blob_alpha(reflection_mask, iris_mask, blob_blur, blob_sigma_scale)
+    return highlight_color, blob_alpha_map
+
+
+def compose_lowfreq_blobify(
+    image_bgr: np.ndarray,
+    reflection_mask: np.ndarray,
+    iris_mask: np.ndarray,
+    lowfreq_base: np.ndarray,
+    highlight_color: np.ndarray,
+    blob_alpha_map: np.ndarray,
+    mask_feather: int,
+    lowfreq_kernel: int,
+    lowfreq_alpha: float,
+    highlight_alpha: float,
+) -> np.ndarray:
+    image_f = image_bgr.astype(np.float32)
+    lowfreq_alpha = float(np.clip(lowfreq_alpha, 0.0, 1.0))
+    highlight_alpha = float(np.clip(highlight_alpha, 0.0, 1.0))
+    target = image_f * (1.0 - lowfreq_alpha) + lowfreq_base * lowfreq_alpha
+    target = target * (1.0 - blob_alpha_map[:, :, None] * highlight_alpha)
+    target += highlight_color[None, None, :] * (blob_alpha_map[:, :, None] * highlight_alpha)
+
+    composite_feather = ensure_odd(max(mask_feather, int(round(lowfreq_kernel * 0.35))))
+    composite_alpha = feathered_alpha(reflection_mask, composite_feather)
+    composite_alpha *= (iris_mask > 0).astype(np.float32)
+    return alpha_composite_with_alpha(image_bgr, target.astype(np.uint8), composite_alpha)
+
+
 def reflection_lowfreq_blobify(
     image_bgr: np.ndarray,
     reflection_mask: np.ndarray,
@@ -427,40 +512,30 @@ def reflection_lowfreq_blobify(
     blob_brightness = float(np.clip(blob_brightness, 0.0, 1.35))
     blob_sigma_scale = float(np.clip(blob_sigma_scale, 0.1, 2.0))
 
-    image_f = image_bgr.astype(np.float32)
-    gaussian_low = cv2.GaussianBlur(image_bgr, (lowfreq_kernel, lowfreq_kernel), 0).astype(np.float32)
-    median_kernel = ensure_odd(min(31, max(3, lowfreq_kernel // 3)))
-    median_low = cv2.medianBlur(image_bgr, median_kernel).astype(np.float32)
-    bilateral_low = cv2.bilateralFilter(image_bgr, d=9, sigmaColor=55, sigmaSpace=25).astype(np.float32)
-
-    lowfreq_base = gaussian_low * 0.62 + median_low * 0.23 + bilateral_low * 0.15
-    target = image_f * (1.0 - lowfreq_alpha) + lowfreq_base * lowfreq_alpha
-
-    mask_bool = reflection_mask > 0
-    highlight_pixels = image_bgr[mask_bool]
-    if len(highlight_pixels) == 0:
+    lowfreq_base = create_lowfreq_base(image_bgr, lowfreq_kernel)
+    highlight_components = create_lowfreq_highlight_components(
+        image_bgr,
+        reflection_mask,
+        iris_mask,
+        blob_blur,
+        blob_brightness,
+        blob_sigma_scale,
+    )
+    if highlight_components is None:
         return image_bgr.copy()
-
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    highlight_gray = gray[mask_bool]
-    top_cut = np.percentile(highlight_gray, 80)
-    top_pixels = highlight_pixels[highlight_gray >= top_cut]
-    if len(top_pixels) == 0:
-        top_pixels = highlight_pixels
-
-    base_color = np.percentile(highlight_pixels.astype(np.float32), 60, axis=0)
-    top_color = top_pixels.astype(np.float32).mean(axis=0)
-    highlight_color = base_color * 0.55 + top_color * 0.45
-    highlight_color = np.clip(highlight_color * blob_brightness, 0, 225)
-
-    blob_alpha_map = component_blob_alpha(reflection_mask, iris_mask, blob_blur, blob_sigma_scale)
-    target = target * (1.0 - blob_alpha_map[:, :, None] * highlight_alpha)
-    target += highlight_color[None, None, :] * (blob_alpha_map[:, :, None] * highlight_alpha)
-
-    composite_feather = ensure_odd(max(mask_feather, int(round(lowfreq_kernel * 0.35))))
-    composite_alpha = feathered_alpha(reflection_mask, composite_feather)
-    composite_alpha *= (iris_mask > 0).astype(np.float32)
-    return alpha_composite_with_alpha(image_bgr, target.astype(np.uint8), composite_alpha)
+    highlight_color, blob_alpha_map = highlight_components
+    return compose_lowfreq_blobify(
+        image_bgr,
+        reflection_mask,
+        iris_mask,
+        lowfreq_base,
+        highlight_color,
+        blob_alpha_map,
+        mask_feather,
+        lowfreq_kernel,
+        lowfreq_alpha,
+        highlight_alpha,
+    )
 
 
 def reflection_inpaint(
@@ -863,6 +938,184 @@ def make_blobify_quick_sweep_grid(
     plt.close()
 
 
+def save_lowfreq_focused_sweep(
+    image: np.ndarray,
+    pts: np.ndarray,
+    iris_mask: np.ndarray,
+    comparison_mask: np.ndarray,
+    reflection_mask: np.ndarray,
+    args: argparse.Namespace,
+    paths: Dict[str, Path],
+) -> None:
+    sweep_dir = paths["baselines"] / "lowfreq_sweep"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    reference_results = {
+        "original": image,
+        "ellipse_subtle_blur_1.4_0.60": subtle_blur_baseline(
+            image,
+            comparison_mask,
+            kernel_size=args.blur_kernel,
+            blend=0.60,
+        ),
+    }
+
+    variants: Dict[str, np.ndarray] = {}
+    metrics_rows = []
+    original_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    original_lap = cv2.Laplacian(original_gray, cv2.CV_64F)
+    reflection_bool = reflection_mask > 0
+    bilateral_low = cv2.bilateralFilter(image, d=9, sigmaColor=55, sigmaSpace=25).astype(np.float32)
+    blob_blur = ensure_odd(max(3, args.blob_blur))
+    blob_brightness = float(np.clip(args.blob_brightness, 0.0, 1.35))
+    blob_sigma_scale = float(np.clip(args.blob_sigma_scale, 0.1, 2.0))
+    highlight_components = create_lowfreq_highlight_components(
+        image,
+        reflection_mask,
+        iris_mask,
+        blob_blur,
+        blob_brightness,
+        blob_sigma_scale,
+    )
+    if highlight_components is None:
+        raise RuntimeError("Reflection mask is empty; cannot run focused lowfreq sweep.")
+    highlight_color, blob_alpha_map = highlight_components
+
+    for kernel in LOWFREQ_SWEEP_KERNELS:
+        lowfreq_base = create_lowfreq_base(image, kernel, bilateral_low=bilateral_low)
+        for lowfreq_alpha in LOWFREQ_SWEEP_ALPHAS:
+            for highlight_alpha in LOWFREQ_SWEEP_HIGHLIGHT_ALPHAS:
+                name = lowfreq_setting_name(kernel, lowfreq_alpha, highlight_alpha)
+                result = compose_lowfreq_blobify(
+                    image,
+                    reflection_mask,
+                    iris_mask,
+                    lowfreq_base,
+                    highlight_color,
+                    blob_alpha_map,
+                    args.mask_feather,
+                    kernel,
+                    lowfreq_alpha,
+                    highlight_alpha,
+                )
+                variants[name] = result
+                save_image(sweep_dir / f"{name}.png", result)
+
+                row = metric_row(name, image, result, reflection_mask, iris_mask)
+                edited_gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+                row["laplacian_reduction_ratio"] = (
+                    row["laplacian_variance_inside_reflection_mask_after"]
+                    / row["laplacian_variance_inside_reflection_mask_before"]
+                )
+                row["edge_reduction_ratio"] = (
+                    row["edge_magnitude_inside_reflection_mask_after"]
+                    / row["edge_magnitude_inside_reflection_mask_before"]
+                )
+                # Proxy for visible artifacts: high outside-mask change is bad.
+                row["selection_score"] = (
+                    row["laplacian_reduction_ratio"]
+                    + 0.7 * row["edge_reduction_ratio"]
+                    + 0.08 * row["changed_pixel_magnitude_outside_reflection_mask"]
+                )
+                row["edge_delta_mean_inside_reflection_mask"] = masked_mean(
+                    np.abs(
+                        original_lap
+                        - cv2.Laplacian(edited_gray, cv2.CV_64F)
+                    ),
+                    reflection_bool,
+                )
+                metrics_rows.append(row)
+
+    sweep_grid_path = paths["grids"] / "lowfreq_focused_sweep_eyezoom_grid.png"
+    fig, axes = plt.subplots(
+        len(LOWFREQ_SWEEP_KERNELS) * len(LOWFREQ_SWEEP_ALPHAS),
+        len(LOWFREQ_SWEEP_HIGHLIGHT_ALPHAS),
+        figsize=(5.0 * len(LOWFREQ_SWEEP_HIGHLIGHT_ALPHAS), 2.8 * len(LOWFREQ_SWEEP_KERNELS) * len(LOWFREQ_SWEEP_ALPHAS)),
+    )
+    axes = np.atleast_2d(axes)
+
+    row_idx = 0
+    for kernel in LOWFREQ_SWEEP_KERNELS:
+        for lowfreq_alpha in LOWFREQ_SWEEP_ALPHAS:
+            for col_idx, highlight_alpha in enumerate(LOWFREQ_SWEEP_HIGHLIGHT_ALPHAS):
+                name = lowfreq_setting_name(kernel, lowfreq_alpha, highlight_alpha)
+                eye_crop = crop_eye_region(variants[name], pts)
+                axes[row_idx, col_idx].imshow(cv2.cvtColor(eye_crop, cv2.COLOR_BGR2RGB))
+                axes[row_idx, col_idx].set_title(
+                    f"k={kernel}, alpha={lowfreq_alpha:.2f}\nhighlight={highlight_alpha:.2f}",
+                    fontsize=9,
+                )
+                axes[row_idx, col_idx].axis("off")
+            row_idx += 1
+
+    plt.tight_layout()
+    plt.savefig(sweep_grid_path, dpi=220)
+    plt.close()
+
+    comparison_names = [*reference_results.keys(), *variants.keys()]
+    comparison_images = {**reference_results, **variants}
+    comparison_path = paths["grids"] / "lowfreq_focused_comparison_grid_full_and_eyezoom.png"
+    fig, axes = plt.subplots(len(comparison_names), 2, figsize=(11, 3.0 * len(comparison_names)))
+    axes = np.atleast_2d(axes)
+
+    for row_idx, name in enumerate(comparison_names):
+        full_rgb = cv2.cvtColor(comparison_images[name], cv2.COLOR_BGR2RGB)
+        eye_rgb = cv2.cvtColor(crop_eye_region(comparison_images[name], pts), cv2.COLOR_BGR2RGB)
+        axes[row_idx, 0].imshow(full_rgb)
+        axes[row_idx, 0].set_title(f"{pretty_name(name)} - full")
+        axes[row_idx, 0].axis("off")
+        axes[row_idx, 1].imshow(eye_rgb)
+        axes[row_idx, 1].set_title(f"{pretty_name(name)} - eye zoom")
+        axes[row_idx, 1].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(comparison_path, dpi=220)
+    plt.close()
+
+    metrics_path = paths["metrics"] / "lowfreq_focused_sweep_metrics.csv"
+    fieldnames = list(metrics_rows[0].keys())
+    with metrics_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics_rows)
+
+    best = min(metrics_rows, key=lambda row: row["selection_score"])
+    best_name = str(best["method"])
+    best_readable = lowfreq_setting_label(51, 0.85, 0.15)
+    summary_path = paths["metrics"] / "lowfreq_focused_sweep_summary.txt"
+    with summary_path.open("w", encoding="utf-8") as f:
+        f.write("Focused reflection_lowfreq_blobify sweep\n")
+        f.write("Mask mode: specular_edge (fixed)\n")
+        f.write("Reference methods: original, ellipse_subtle_blur_1.4_0.60\n\n")
+        f.write("Recommended visual setting:\n")
+        f.write(f"- {best_readable}\n")
+        f.write(
+            "- Naturalness: keeps a soft corneal highlight without the large opaque white "
+            "patches seen in more aggressive blobify attempts.\n"
+        )
+        f.write(
+            "- Reflection suppression: stronger than the 0.75 alpha variants while keeping "
+            "the reflected building/window structure less legible.\n"
+        )
+        f.write(
+            "- Artifact risk: highlight-alpha=0.15 is less shiny than 0.25; kernel=51 avoids "
+            "a slightly broader smoothed look from kernel=61.\n\n"
+        )
+        f.write("Best proxy setting:\n")
+        f.write(f"- {best_name}\n")
+        f.write(f"- Laplacian ratio after/before: {best['laplacian_reduction_ratio']:.3f}\n")
+        f.write(f"- Edge ratio after/before: {best['edge_reduction_ratio']:.3f}\n")
+        f.write(
+            "- Rationale: lowest combined proxy score balancing reflection-detail reduction "
+            "against change outside the reflection mask. In this run it matches the visual "
+            "recommendation above.\n\n"
+        )
+        f.write("Files to inspect:\n")
+        f.write(f"- {sweep_grid_path.as_posix()}\n")
+        f.write(f"- {comparison_path.as_posix()}\n")
+        f.write(f"- {sweep_dir.as_posix()}\n")
+
+
 def run(args: argparse.Namespace) -> None:
     image_path = Path(args.image)
     out_dir = Path(args.out)
@@ -908,6 +1161,40 @@ def run(args: argparse.Namespace) -> None:
 
     comparison_infos = get_iris_infos(pts, cornea_scale=1.4)
     comparison_mask = create_ellipse_mask(image.shape, comparison_infos, feather=args.mask_feather)
+
+    if args.lowfreq_focused_sweep:
+        fixed_reflection_mask = create_reflection_candidate_mask(
+            image,
+            iris_mask,
+            reflection_thresh=args.reflection_thresh,
+            mask_mode="specular_edge",
+            edge_thresh=args.edge_thresh,
+            canny_low=args.canny_low,
+            canny_high=args.canny_high,
+            mask_dilate=args.mask_dilate,
+        )
+        save_image(paths["debug"] / "debug_reflection_mask.png", fixed_reflection_mask)
+        save_image(
+            paths["debug"] / "debug_reflection_mask_overlay.png",
+            draw_reflection_overlay(image, fixed_reflection_mask, iris_infos),
+        )
+        save_lowfreq_focused_sweep(
+            image,
+            pts,
+            iris_mask,
+            comparison_mask,
+            fixed_reflection_mask,
+            args,
+            paths,
+        )
+        print("Done.")
+        print(f"Focused lowfreq sweep saved to: {out_dir.resolve()}")
+        print("Mask mode: specular_edge")
+        print(f"Reflection mask pixels: {int(np.count_nonzero(fixed_reflection_mask))}")
+        print("Sweep grid: grids/lowfreq_focused_sweep_eyezoom_grid.png")
+        print("Comparison grid: grids/lowfreq_focused_comparison_grid_full_and_eyezoom.png")
+        print("Summary: metrics/lowfreq_focused_sweep_summary.txt")
+        return
 
     if args.quick_sweep:
         make_blobify_quick_sweep_grid(
@@ -965,6 +1252,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mask-dilate", type=int, default=1, help="Dilation control for soft/dilated edge mask modes")
     parser.add_argument("--mask-sweep-only", action="store_true", help="Only save mask sweep overlays/debug grid")
     parser.add_argument("--quick-sweep", action="store_true", help="Save a compact blobify parameter sweep grid and per-setting outputs")
+    parser.add_argument("--lowfreq-focused-sweep", action="store_true", help="Run the fixed specular_edge reflection_lowfreq_blobify sweep")
     parser.add_argument("--include-ns", action="store_true", help="Include Navier-Stokes inpainting in outputs and comparison grids")
     parser.add_argument("--mask-feather", type=int, default=11, help="Gaussian feather size for mask compositing")
     parser.add_argument("--blur-kernel", type=int, default=31, help="Gaussian blur kernel for blur baselines")
